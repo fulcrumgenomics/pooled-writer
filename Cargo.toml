@@ -1,0 +1,35 @@
+[package]
+name = "pooled-writer"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Seth Stadick <seth@fulcrumgenomics.com>"
+]
+license = "MIT"
+readme = "README.md"
+documentation = "https://docs.rs/pooled-writer"
+homepage = "https://github.com/fulcrumgenomics/pooled-writer"
+repository = "https://github.com/fulcrumgenomics/pooled-writer"
+description = "Utility library for creating M compressed writers over N threads"
+keywords = ["bioinformatics", "genomic", "compression", "writer"]
+categories = ["science", "compression"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["bgzf_compressor"]
+bgzf_compressor = ["bgzf"] 
+
+[dependencies]
+bgzf = { git = "ssh://git@github.com/fulcrumgenomics/bgzf.git", optional = true}
+bytes = "1.1.0"
+flume = "0.10.9"
+parking_lot = "0.12.0"
+thiserror = "1.0.30"
+
+[dev-dependencies]
+bgzf = { git = "ssh://git@github.com/fulcrumgenomics/bgzf.git"}
+num_cpus = "1.13.0"
+proptest = "1.0.0"
+rand = "0.8.4"
+tempfile = "3.2.0"
