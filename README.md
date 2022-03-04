@@ -15,3 +15,32 @@ Note that this is an alpha release and the API could change drastically in futur
 ## Documentation and Examples
 
 Please see the generated [Rust Docs](https://docs.rs/pooled-writer).
+
+## How to use in your project
+
+Add the following to your `Cargo.toml` dependencies section, updating the version number as needed.
+
+```toml
+[dependencies]
+pooled-writer = "*"
+```
+
+By default this will come with a BGZF compressor. If that is not needed then add the `default-features = true` specifier to the dependency declaration above (i.e. `pooled-writer = {version = "*", default-features = false}`).
+
+## How to build and test locally
+
+Assuming you have cloned the repo and are in the top level:
+
+```bash
+cargo test
+# The following test is more comprehensive and may take up to 10 minutes to run
+cargo test -- --ignored
+```
+
+## How to publish
+
+This assumes that you have installed `cargo-release` via `cargo install cargo-release` and have set up credentials with `crates.io`.
+
+```bash
+cargo release <path|minor|major>
+```
