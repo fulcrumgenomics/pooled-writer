@@ -3,14 +3,15 @@ name = "pooled-writer"
 version = "0.2.1-alpha.0"
 edition = "2021"
 authors = [
-    "Seth Stadick <seth@fulcrumgenomics.com>"
+    "Seth Stadick <seth@fulcrumgenomics.com>",
+    "Tim Fennell <tim@fulcrumgenomics.com>"
 ]
 license = "MIT"
 readme = "README.md"
 documentation = "https://docs.rs/pooled-writer"
 homepage = "https://github.com/fulcrumgenomics/pooled-writer"
 repository = "https://github.com/fulcrumgenomics/pooled-writer"
-description = "Utility library for creating M compressed writers over N threads"
+description = "Library for using N threads to write to M compressed files/writers."
 keywords = ["bioinformatics", "genomic", "compression", "writer"]
 categories = ["science", "compression"]
 
