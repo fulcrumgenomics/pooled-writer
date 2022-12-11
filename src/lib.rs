@@ -679,7 +679,7 @@ mod test {
     use crate::bgzf::BgzfCompressor;
 
     use super::*;
-    use bgzf::Reader;
+    use ::bgzf::Reader;
     use proptest::prelude::*;
     use tempfile::tempdir;
 
