@@ -7,13 +7,21 @@ pub struct BgzfCompressor {
 }
 
 impl Compressor for BgzfCompressor {
-    type CompressionLevel = bgzf::CompressionLevel;
     type Error = bgzf::BgzfError;
+    type CompressionLevel = bgzf::CompressionLevel;
 
     const BLOCK_SIZE: usize = bgzf::BGZF_BLOCK_SIZE;
 
     fn new(compression_level: Self::CompressionLevel) -> Self {
         Self { inner: bgzf::Compressor::new(compression_level) }
+    }
+
+    fn default_compression_level() -> Self::CompressionLevel {
+        bgzf::CompressionLevel::new(5).unwrap()
+    }
+
+    fn new_compression_level(compression_level: u8) -> Result<Self::CompressionLevel, Self::Error> {
+        bgzf::CompressionLevel::new(compression_level)
     }
 
     fn compress(
@@ -27,9 +35,5 @@ impl Compressor for BgzfCompressor {
             bgzf::Compressor::append_eof(output);
         }
         Ok(())
-    }
-
-    fn new_compression_level(compression_level: u8) -> Result<Self::CompressionLevel, Self::Error> {
-        bgzf::CompressionLevel::new(compression_level)
     }
 }

@@ -2,30 +2,37 @@
 //!
 //! # Overview
 //!
-//! A [`Pool`] is created, started, and writers exchanged for [`PooledWriter`]s all at once in [`Pool::new`].
-//! When creating a pool via [`Pool::new`] two types must be specified: the `W` Writer type and the `C` compressor type.
-//! The `W` may be elided since it's an input. The `C` must be specified as something that implements [`Compressor`].
-//! See `examples/ex1.rs`.
+//! `pooled-writer` solves the problem of compressing and writing data to a set of writers using
+//! multiple threads, where the number of writers and threads cannot easily be equal.  For example
+//! writing to hundreds of gzipped files using 16 threads, or writing to a four gzipped files
+//! using 32 threads.
 //!
-//! The [`Pool`] consists of two threadpools, one for compressing and one for writing. All concurrency
-//! is managed via message passing over channels.
+//! To accomplish this, a pool is configured and writers are exchanged for [`PooledWriter`]s
+//! that can be used in place of the original writers.  This is accomplished using the
+//! [`PoolBuilder`] which is the preferred way to configure and create a pool.  The [`Pool`] and
+//! builder require two generic types: the `W` Writer type and the `C` compressor type. `W` may
+//! usually be elided if calls to [`PoolBuilder::exchange`] may be used to infer the type. `C`
+//! must be specified as something that implements [`Compressor`].
 //!
-//! Every time the internal buffer of a [`PooledWriter`] reaches capacity (defined by [`Compressor::BLOCK_SIZE`])
-//! it sends two messages:
-//! 1. It sends a message over the corresponding writers channel to the writer pool, enqueueing
+//! The [`Pool`] consists of two thread pools, one for compressing and one for writing. All
+//! concurrency is managed via message passing over channels.
+//!
+//! Every time the internal buffer of a [`PooledWriter`] reaches capacity (defined by
+//! [`Compressor::BLOCK_SIZE`]) it sends two messages:
+//! 1. It sends a message over the corresponding writer's channel to the writer pool, enqueueing
 //!    a one-shot receiver channel in the writers queue that will receive the compressed bytes
 //!    once the compressor is done. This is done to maintain the output order.
 //! 2. It sends a message to the compressor pool that contains a buffer of bytes to compress
 //!    as well as the sender side of the one-shot channel to send the compressed bytes on.
 //!
-//! The writer threadpool contains a `Vec` of receivers, one for each writer. It loops over
+//! The writer thread pool contains a `Vec` of receivers, one for each writer. It loops over
 //! this `Vec`, checking to see if the receiver has any messages. If it does, a lock is
 //! acquired and that writer's receiver is drained, writing to the underlying writer that was exchanged
 //! for the [`PooledWriter`].
 //!
-//! The compressor threadpool consists of a single receiver that is continually polled for new
+//! The compressor thread pool consists of a single receiver that is continually polled for new
 //! messages. The messages are processed, the bytes compressed, and then the compressed bytes are
-//! sent over the one-shot channel to the corresponding receiver, which is a place-holder receivers
+//! sent over the one-shot channel to the corresponding receiver, which is a place-holder receiver
 //! in the writer queues.
 //!
 //! Shutdown of the entire pool is managed via a sentinel value that is checked in the writer loop.
@@ -42,7 +49,7 @@
 //!     path::Path,
 //! };
 //!
-//! use pooled_writer::{Compressor, Pool, bgzf::BgzfCompressor};
+//! use pooled_writer::{Compressor, PoolBuilder, Pool, bgzf::BgzfCompressor};
 //!
 //! type DynError = Box<dyn Error + 'static>;
 //!
@@ -52,11 +59,18 @@
 //!
 //! fn main() -> Result<(), DynError> {
 //!     let writers = vec![
-//!         create_writer("./test1.txt.gz")?,
-//!         create_writer("./test2.txt.gz")?,
-//!         create_writer("./test3.txt.gz")?,
+//!         create_writer("/tmp/test1.txt.gz")?,
+//!         create_writer("/tmp/test2.txt.gz")?,
+//!         create_writer("/tmp/test3.txt.gz")?,
 //!     ];
-//!     let (mut pool, mut pooled_writers) = Pool::new::<_, BgzfCompressor>(4, 4, 4, writers)?;
+//!
+//!     let mut builder = PoolBuilder::<_, BgzfCompressor>::new(10, 10)
+//!         .writer_threads(2)
+//!         .compressor_threads(4)
+//!         .compression_level(5)?;
+//!
+//!    let mut pooled_writers = writers.into_iter().map(|w| builder.exchange(w)).collect::<Vec<_>>();
+//!    let mut pool = builder.build()?;
 //!
 //!     writeln!(&mut pooled_writers[1], "This is writer2")?;
 //!     writeln!(&mut pooled_writers[0], "This is writer1")?;
@@ -87,7 +101,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use flume::{bounded, unbounded, Receiver, Sender};
+use flume::{self, Receiver, Sender};
 use parking_lot::{lock_api::RawMutex, Mutex};
 use thiserror::Error;
 
@@ -113,6 +127,10 @@ pub enum PoolError {
     Io(#[from] io::Error),
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// The PooledWriter and it's impls
+////////////////////////////////////////////////////////////////////////////////
+
 /// A [`PooledWriter`] is created by exchanging a writer with a [`Pool`].
 ///
 /// The pooled writer will internally buffer writes, sending bytes to the [`Pool`]
@@ -123,7 +141,7 @@ pub enum PoolError {
 #[derive(Debug)]
 pub struct PooledWriter {
     /// Channel to send messages containing bytes to compress to the compressors' pool.
-    pool_tx: Sender<CompressorMessage>,
+    compressor_tx: Sender<CompressorMessage>,
     /// Channel to send the receiving end of the one-shot channel that will be
     /// used to send the compressed bytes. This effectively "place holds" the
     /// position of the compressed bytes in the writers queue until the compressed bytes
@@ -140,12 +158,12 @@ impl PooledWriter {
     ///
     /// # Arguments
     /// - `writers` - The conventional [`Write`] writers that are being exchanged.
-    /// - `pool_tx` - The channel to send uncompressed bytes to the compressor pool.
+    /// - `compressor_tx` - The channel to send uncompressed bytes to the compressor pool.
     /// - `writer_txs` - The `Send` ends of the channels that transmit the `Receiver` ends of the one-shot
     ///                  channels, which will be consumed when the compressor sends the compressed bytes.
     fn from_writers<W, C>(
         writers: &[W],
-        pool_tx: &Sender<CompressorMessage>,
+        compressor_tx: &Sender<CompressorMessage>,
         writer_txs: &[Sender<Receiver<WriterMessage>>],
     ) -> Vec<Self>
     where
@@ -155,25 +173,25 @@ impl PooledWriter {
         writers
             .iter()
             .zip(writer_txs.iter())
-            .map(|(_w, writer_tx)| Self::new::<C>(pool_tx.clone(), writer_tx.clone()))
+            .map(|(_w, writer_tx)| Self::new::<C>(compressor_tx.clone(), writer_tx.clone()))
             .collect()
     }
 
     /// Create a new [`PooledWriter`] that has an internal buffer capacity that matches [`bgzf::BGZF_BLOCK_SIZE`].
     ///
     /// # Arguments
-    /// - `pool_tx` - The channel to send uncompressed bytes to the compressor pool.
+    /// - `compressor_tx` - The channel to send uncompressed bytes to the compressor pool.
     /// - `writer_tx` - The `Send` end of the channel that transmits the `Receiver` end of the one-shot
     ///                 channel, which will be consumed when the compressor sends the compressed bytes.
     fn new<C>(
-        pool_tx: Sender<CompressorMessage>,
+        compressor_tx: Sender<CompressorMessage>,
         writer_tx: Sender<Receiver<WriterMessage>>,
     ) -> Self
     where
         C: Compressor,
     {
         Self {
-            pool_tx,
+            compressor_tx,
             writer_tx,
             buffer: BytesMut::with_capacity(C::BLOCK_SIZE),
             buffer_size: C::BLOCK_SIZE,
@@ -208,7 +226,7 @@ impl PooledWriter {
         self.writer_tx
             .send(r)
             .map_err(|_e| io::Error::new(io::ErrorKind::Other, PoolError::ChannelSend))?;
-        self.pool_tx
+        self.compressor_tx
             .send(m)
             .map_err(|_e_| io::Error::new(io::ErrorKind::Other, PoolError::ChannelSend))
     }
@@ -253,6 +271,10 @@ impl Write for PooledWriter {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// The Compressor trait
+////////////////////////////////////////////////////////////////////////////////
+
 /// A [`Compressor`] is used in the compressor pool to compress bytes.
 ///
 /// An implementation must be provided as a type to the [`Pool::new`] function so that the pool
@@ -274,6 +296,9 @@ where
     /// Create a new compressor with the given compression level.
     fn new(compression_level: Self::CompressionLevel) -> Self;
 
+    /// Returns the default compression level for the compressor.
+    fn default_compression_level() -> Self::CompressionLevel;
+
     /// Create an instance of the compression level.
     ///
     /// The validity of the compression level should be checked here.
@@ -289,6 +314,10 @@ where
     ) -> Result<(), Self::Error>;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// The messages passed between threads
+////////////////////////////////////////////////////////////////////////////////
+
 /// A message that is sent from a [`PooledWriter`] to the compressor threadpool within a [`Pool`].
 #[derive(Debug)]
 struct CompressorMessage {
@@ -302,7 +331,7 @@ struct CompressorMessage {
 
 impl CompressorMessage {
     fn new_parts(buffer: Bytes) -> (Self, Receiver<WriterMessage>) {
-        let (tx, rx) = unbounded(); // oneshot channel
+        let (tx, rx) = flume::unbounded(); // oneshot channel
         let new = Self { buffer, oneshot: tx, is_last: false };
         (new, rx)
     }
@@ -316,6 +345,127 @@ impl CompressorMessage {
 struct WriterMessage {
     buffer: Vec<u8>,
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// The PoolBuilder struct and impls
+////////////////////////////////////////////////////////////////////////////////
+
+/// A struct to make building up a Pool simpler.  The builder should be constructed using
+/// [`PoolBuilder::new`], which provides the user control over the sizes of the queues used for
+/// compression and writing.  It should be noted that a single compression queue is created,
+/// and one writer queue per writer exchanged.  A good starting point for these queue sizes is
+/// two times the number of threads.
+///
+/// Once created various functions can configure aspects of the pool.  It is best practice, though
+/// not required, to configure the builder _before_ exchanging writers.
+///
+/// Once the builder is configured writers may be exchanged for [`PooledWriter`]s using the
+/// [`PoolBuilder::exchange`] function, which consumes the provided writer and returns a new
+/// writer that can be used in it's place.
+///
+/// After exchanging all writers the pool may be created and started with [`PoolBuilder::build`]
+/// which consumes the builder and after which no more writers may be exchanged.
+pub struct PoolBuilder<W, C>
+where
+    W: Write + Send + 'static,
+    C: Compressor,
+{
+    compression_level: C::CompressionLevel,
+    writer_queue_size: usize,
+    writer_threads: usize,
+    compressor_threads: usize,
+    compressor_tx: Sender<CompressorMessage>,
+    compressor_rx: Receiver<CompressorMessage>,
+    writers: Vec<W>,
+    writer_txs: Vec<Sender<Receiver<WriterMessage>>>,
+    writer_rxs: Vec<Receiver<Receiver<WriterMessage>>>,
+}
+
+impl<W, C> PoolBuilder<W, C>
+where
+    W: Write + Send + 'static,
+    C: Compressor,
+{
+    /// Creates a new PoolBuilder that can be used to configure and build a [`Pool`].
+    pub fn new(compressor_queue_size: usize, writer_queues_size: usize) -> Self {
+        let (compressor_tx, compressor_rx) = flume::bounded(compressor_queue_size);
+
+        PoolBuilder {
+            compression_level: C::default_compression_level(),
+            writer_queue_size: writer_queues_size,
+            writer_threads: 1,
+            compressor_threads: 1,
+            compressor_tx,
+            compressor_rx,
+            writers: vec![],
+            writer_txs: vec![],
+            writer_rxs: vec![],
+        }
+    }
+
+    /// Sets the number of writer threads that will be used by the [[Pool]].
+    pub fn writer_threads(mut self, n: usize) -> Self {
+        self.writer_threads = n;
+        self
+    }
+
+    /// Sets the number of compressor threads that will be used by the [[Pool]].
+    pub fn compressor_threads(mut self, n: usize) -> Self {
+        self.compressor_threads = n;
+        self
+    }
+
+    /// Sets the compression level that will be used by the [[Pool]].
+    pub fn compression_level(mut self, level: u8) -> PoolResult<Self> {
+        self.compression_level = C::new_compression_level(level)
+            .map_err(|e| PoolError::CompressionError(e.to_string()))?;
+        Ok(self)
+    }
+
+    /// Exchanges a writer for a [[PooledWriter]].
+    pub fn exchange(&mut self, writer: W) -> PooledWriter {
+        let (tx, rx): (Sender<Receiver<WriterMessage>>, Receiver<Receiver<WriterMessage>>) =
+            flume::bounded(self.writer_queue_size);
+        let p = PooledWriter::new::<C>(self.compressor_tx.clone(), tx.clone());
+
+        self.writers.push(writer);
+        self.writer_txs.push(tx);
+        self.writer_rxs.push(rx);
+        p
+    }
+
+    /// Consumes the builder and generates the [[Pool]] ready for use.
+    pub fn build(self) -> PoolResult<Pool> {
+        // Create the channel to gracefully signal a shutdown of the pool
+        let (shutdown_tx, shutdown_rx) = flume::unbounded();
+
+        // Start the pool manager thread and thread pools
+        let handle = std::thread::spawn(move || {
+            Pool::pool_main::<W, C>(
+                self.writer_threads,
+                self.compressor_threads,
+                self.compression_level,
+                self.compressor_rx,
+                self.writer_rxs,
+                self.writers,
+                shutdown_rx,
+            )
+        });
+
+        let mut pool = Pool {
+            compressor_tx: Some(self.compressor_tx),
+            writers_txs: Some(self.writer_txs),
+            shutdown_tx: Some(shutdown_tx),
+            pool_handle: Some(handle),
+        };
+
+        Ok(pool)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// The Pool struct and impls
+////////////////////////////////////////////////////////////////////////////////
 
 /// A [`Pool`] orchestrates two different threadpools, a compressor pool and a writer pool.
 ///
@@ -342,6 +492,7 @@ impl Pool {
     /// - `compression_level` - The compression level to use for the [`Compressor`] pool.
     /// - `writers` - The writers to exchange for [`PooledWriter`]s.
     #[allow(clippy::type_complexity, clippy::similar_names)]
+    #[deprecated(since = "0.3.0", note = "Use PoolBuilder in place of Pool::new().")]
     pub fn new<W, C>(
         num_writer_threads: usize,
         num_compressor_threads: usize,
@@ -352,42 +503,14 @@ impl Pool {
         W: Write + Send + 'static,
         C: Compressor,
     {
-        let compression_level = C::new_compression_level(compression_level)
-            .map_err(|e| PoolError::CompressionError(e.to_string()))?;
-        // Create the channels that the writers will send bytes to be compressed
-        let (compressor_tx, compressor_rx) = flume::bounded(num_compressor_threads * 2);
-        // Create the channel to gracefully signal a shutdown of the pool
-        let (shutdown_tx, shutdown_rx) = flume::unbounded();
+        let mut builder =
+            PoolBuilder::<W, C>::new(num_compressor_threads * 2, num_writer_threads * 2)
+                .compressor_threads(num_compressor_threads)
+                .writer_threads(num_writer_threads)
+                .compression_level(compression_level)?;
 
-        // Create the channels that will enqueue the promise of compressed bytes for the writers
-        let (writers_txs, writers_rxs): (
-            Vec<Sender<Receiver<WriterMessage>>>,
-            Vec<Receiver<Receiver<WriterMessage>>>,
-        ) = (0..writers.len()).map(|_| flume::bounded(num_writer_threads * 2)).unzip();
-
-        // Wrap writers to be pooled writers.
-        let pooled_writers =
-            PooledWriter::from_writers::<W, C>(&writers, &compressor_tx, &writers_txs);
-
-        // Start the pool manager thread and thread pools
-        let handle = std::thread::spawn(move || {
-            Self::pool_main::<W, C>(
-                num_writer_threads,
-                num_compressor_threads,
-                compression_level,
-                compressor_rx,
-                writers_rxs,
-                writers,
-                shutdown_rx,
-            )
-        });
-
-        let mut pool = Self {
-            compressor_tx: Some(compressor_tx),
-            writers_txs: Some(writers_txs),
-            shutdown_tx: Some(shutdown_tx),
-            pool_handle: Some(handle),
-        };
+        let pooled_writers = writers.into_iter().map(|w| builder.exchange(w)).collect();
+        let pool = builder.build()?;
         Ok((pool, pooled_writers))
     }
 
@@ -541,6 +664,10 @@ impl Drop for Pool {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Tests
+////////////////////////////////////////////////////////////////////////////////
+
 #[cfg(test)]
 mod test {
     use std::{
@@ -574,8 +701,39 @@ mod test {
             .collect();
         let output_writers = output_names.iter().map(create_output_writer).collect();
 
+        #[allow(deprecated)]
         let (mut pool, mut pooled_writers) =
             Pool::new::<_, BgzfCompressor>(1, 1, 2, output_writers).unwrap();
+
+        for (i, writer) in pooled_writers.iter_mut().enumerate() {
+            writer.write_all(format!("This is writer {}.", i).as_bytes()).unwrap();
+        }
+        pooled_writers.into_iter().try_for_each(|mut w| w.flush()).unwrap();
+        pool.stop_pool();
+
+        for (i, path) in output_names.iter().enumerate() {
+            let mut reader = Reader::new(BufReader::new(File::open(path).unwrap()));
+            let mut actual = vec![];
+            reader.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, format!("This is writer {}.", i).as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_builder() {
+        let dir = tempdir().unwrap();
+        let output_names: Vec<PathBuf> = (0..20)
+            .into_iter()
+            .map(|i| create_output_file_name(format!("test.{}.txt.gz", i), &dir.path()))
+            .collect();
+
+        let output_writers: Vec<BufWriter<File>> =
+            output_names.iter().map(create_output_writer).collect();
+        let mut builder =
+            PoolBuilder::<_, BgzfCompressor>::new(10, 10).compression_level(2).unwrap();
+        let mut pooled_writers: Vec<PooledWriter> =
+            output_writers.into_iter().map(|w| builder.exchange(w)).collect();
+        let mut pool = builder.build().unwrap();
 
         for (i, writer) in pooled_writers.iter_mut().enumerate() {
             writer.write_all(format!("This is writer {}.", i).as_bytes()).unwrap();
