@@ -370,6 +370,7 @@ where
     C: Compressor,
 {
     /// Creates a new PoolBuilder that can be used to configure and build a [`Pool`].
+    /// The `queue_size` must be greater than the number of `threads`.
     pub fn new(queue_size: usize, threads: usize) -> Self {
         assert!(threads > 0, "Cannot construct a pooled writer with 0 threads");
         assert!(
@@ -500,8 +501,8 @@ impl Pool {
     /// # Arguments
     /// - `num_threads` - The number of threads to use.
     /// - `compression_level` - The compression level to use for the [`Compressor`] pool.
-    /// - `rx_compressor` - The receiving end of the channel for communicating with the compressor pool.
-    /// - `rxs_writers` - The receive halves of the channels for the [`PooledWriter`]s to enqueue the one-shot channels.
+    /// - `compressor_rx ` - The receiving end of the channel for communicating with the compressor pool.
+    /// - `writer_rxs ` - The receive halves of the channels for the [`PooledWriter`]s to enqueue the one-shot channels.
     /// - `writers` - The writers that were exchanged for [`PooledWriter`]s.
     /// - `shutdown_rx` - Sentinel channel to tell the pool management thread to shutdown.
     #[allow(clippy::unnecessary_wraps, clippy::needless_collect, clippy::needless_pass_by_value)]
