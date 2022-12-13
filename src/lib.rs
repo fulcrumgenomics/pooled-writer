@@ -464,34 +464,6 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// Create a running pool along with an associated set of `pooled_writers`.
-    ///
-    /// # Arguments
-    /// - `num_writer_threads` - The number of writer threads to use in the writer pool.
-    /// - `num_compressor_threads` - The number of compressor threads to use in the compressor pool.
-    /// - `compression_level` - The compression level to use for the [`Compressor`] pool.
-    /// - `writers` - The writers to exchange for [`PooledWriter`]s.
-    #[allow(clippy::type_complexity, clippy::similar_names)]
-    #[deprecated(since = "0.3.0", note = "Use PoolBuilder in place of Pool::new().")]
-    pub fn new<W, C>(
-        num_writer_threads: usize,
-        num_compressor_threads: usize,
-        compression_level: u8,
-        writers: Vec<W>,
-    ) -> PoolResult<(Self, Vec<PooledWriter>)>
-    where
-        W: Write + Send + 'static,
-        C: Compressor,
-    {
-        let total_threads = num_compressor_threads + num_writer_threads;
-        let mut builder = PoolBuilder::<W, C>::new(total_threads * 2, total_threads)
-            .compression_level(compression_level)?;
-
-        let pooled_writers = writers.into_iter().map(|w| builder.exchange(w)).collect();
-        let pool = builder.build()?;
-        Ok((pool, pooled_writers))
-    }
-
     /// The main "run" method for the pool that orchestrates all the pieces.
     ///
     /// The [`PooledWriter`]s are sending to the compressor, the compressor compresses them, then forwards the compressed bytes.
@@ -672,33 +644,6 @@ mod test {
 
     #[test]
     fn test_simple() {
-        let dir = tempdir().unwrap();
-        let output_names: Vec<PathBuf> = (0..20)
-            .into_iter()
-            .map(|i| create_output_file_name(format!("test.{}.txt.gz", i), &dir.path()))
-            .collect();
-        let output_writers = output_names.iter().map(create_output_writer).collect();
-
-        #[allow(deprecated)]
-        let (mut pool, mut pooled_writers) =
-            Pool::new::<_, BgzfCompressor>(1, 1, 2, output_writers).unwrap();
-
-        for (i, writer) in pooled_writers.iter_mut().enumerate() {
-            writer.write_all(format!("This is writer {}.", i).as_bytes()).unwrap();
-        }
-        pooled_writers.into_iter().try_for_each(|mut w| w.flush()).unwrap();
-        pool.stop_pool();
-
-        for (i, path) in output_names.iter().enumerate() {
-            let mut reader = Reader::new(BufReader::new(File::open(path).unwrap()));
-            let mut actual = vec![];
-            reader.read_to_end(&mut actual).unwrap();
-            assert_eq!(actual, format!("This is writer {}.", i).as_bytes());
-        }
-    }
-
-    #[test]
-    fn test_builder() {
         let dir = tempdir().unwrap();
         let output_names: Vec<PathBuf> = (0..20)
             .into_iter()
