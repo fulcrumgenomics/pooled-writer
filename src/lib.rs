@@ -434,7 +434,6 @@ where
 
         let mut pool = Pool {
             compressor_tx: Some(self.compressor_tx),
-            writers_txs: Some(self.writer_txs),
             shutdown_tx: Some(shutdown_tx),
             pool_handle: Some(handle),
         };
@@ -457,8 +456,6 @@ pub struct Pool {
     pool_handle: Option<JoinHandle<PoolResult<()>>>,
     /// The send end of the channel for communicating with the compressor pool.
     compressor_tx: Option<Sender<CompressorMessage>>,
-    /// The send halves of the channels for the [`PooledWriter`]s to enqueue the one-shot channels.
-    writers_txs: Option<Vec<Sender<Receiver<WriterMessage>>>>,
     /// Sentinel channel to tell the pool management thread to shutdown.
     shutdown_tx: Option<Sender<()>>,
 }
@@ -587,11 +584,6 @@ impl Pool {
         // Shutdown called to force writers to start checking their receivers for disconnection / empty
         drop(self.shutdown_tx.take());
 
-        // Drop the copy of the writer senders that the pool holds
-        // TODO: the pool probably doesn't need these anyways.
-        self.writers_txs.take().into_iter().enumerate().for_each(|(i, w)| {
-            drop(w);
-        });
         // Wait on the pool thread to finish and pull any errors from it
         match self.pool_handle.take().unwrap().join() {
             Ok(result) => result,
@@ -603,8 +595,7 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         // Check if `stop_pool` has already been called. If it hasn't, call it.
-        if self.compressor_tx.is_some() && self.pool_handle.is_some() && self.writers_txs.is_some()
-        {
+        if self.compressor_tx.is_some() && self.pool_handle.is_some() {
             self.stop_pool().unwrap();
         }
     }
