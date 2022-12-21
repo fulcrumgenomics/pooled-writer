@@ -14,8 +14,8 @@
 //! usually be elided if calls to [`PoolBuilder::exchange`] may be used to infer the type. `C`
 //! must be specified as something that implements [`Compressor`].
 //!
-//! The [`Pool`] consists of two thread pools, one for compressing and one for writing. All
-//! concurrency is managed via message passing over channels.
+//! The [`Pool`] consists of a single thread pool that consumes work from both a compression queue
+//! and a writing queue.  All concurrency is managed via message passing over channels.
 //!
 //! Every time the internal buffer of a [`PooledWriter`] reaches capacity (defined by
 //! [`Compressor::BLOCK_SIZE`]) it sends two messages:
@@ -25,19 +25,22 @@
 //! 2. It sends a message to the compressor pool that contains a buffer of bytes to compress
 //!    as well as the sender side of the one-shot channel to send the compressed bytes on.
 //!
-//! The writer thread pool contains a `Vec` of receivers, one for each writer. It loops over
-//! this `Vec`, checking to see if the receiver has any messages. If it does, a lock is
-//! acquired and that writer's receiver is drained, writing to the underlying writer that was exchanged
-//! for the [`PooledWriter`].
+//! The threads in the thread pool loop continuously until the pool is shut down, and attempt
+//! first receive and compress one block, then secondly to receive and write one compressed block.
+//! A third internal channel is used to manage the queue of writes to be performed so that the
+//! individual per-writer channels (of which there may be many) are only polled if there is likely
+//! to be data available for writing.  When data is available to be written, the appropriate
+//! underlying writer is locked, and the data written.
 //!
-//! The compressor thread pool consists of a single receiver that is continually polled for new
-//! messages. The messages are processed, the bytes compressed, and then the compressed bytes are
-//! sent over the one-shot channel to the corresponding receiver, which is a place-holder receiver
-//! in the writer queues.
+//! When all writing to [`PooledWriter`]s is complete, the writers should be close()'d or drop()'d
+//! and then the pool should be stopped using [`Pool::stop_pool`].  Writers that are not closed
+//! may have data buffered that is never written!  
 //!
-//! Shutdown of the entire pool is managed via a sentinel value that is checked in the writer loop.
-//! If a shutdown has been requested a cascade of channel drops will cleanly disconnect all senders
-//! and receivers and any further calls to [`PooledWriter`]s will result in an error.
+//! [`Pool::stop_pool`] will shutdown channels in a safe order ensuring that data submitted to the
+//! pool is compressed and written before threads are stopped.  After initiating the pool shutdown
+//! any subsequent attempts to write to [`PooledWriter`]s will result in errors.  Likewise any
+//! calls to [`PooledWriter:close`] that cause data to be flushed into the compression queue will
+//! raise errors.
 //!
 //! # Example
 //!
@@ -64,9 +67,8 @@
 //!         create_writer("/tmp/test3.txt.gz")?,
 //!     ];
 //!
-//!     let mut builder = PoolBuilder::<_, BgzfCompressor>::new(10, 10)
-//!         .writer_threads(2)
-//!         .compressor_threads(4)
+//!     let mut builder = PoolBuilder::<_, BgzfCompressor>::new()
+//!         .threads(8)
 //!         .compression_level(5)?;
 //!
 //!    let mut pooled_writers = writers.into_iter().map(|w| builder.exchange(w)).collect::<Vec<_>>();
@@ -93,6 +95,7 @@
 #[cfg(feature = "bgzf_compressor")]
 pub mod bgzf;
 
+use std::time::Duration;
 use std::{
     error::Error,
     io::{self, Read, Write},
@@ -101,7 +104,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use flume::{self, Receiver, Sender};
+use flume::{self, bounded, Receiver, Sender};
 use parking_lot::{lock_api::RawMutex, Mutex};
 use thiserror::Error;
 
@@ -136,10 +139,12 @@ pub enum PoolError {
 /// The pooled writer will internally buffer writes, sending bytes to the [`Pool`]
 /// after the internal buffer has been filled.
 ///
-/// Note that the `pool_tx` channel is shared by all pooled writers, whereas the `writer_tx`
+/// Note that the `compressor_tx` channel is shared by all pooled writers, whereas the `writer_tx`
 /// is specific to the _underlying_ writer that this pooled writer encapsulates.
 #[derive(Debug)]
 pub struct PooledWriter {
+    /// The index/serial number of the pooled writer within the pool
+    writer_index: usize,
     /// Channel to send messages containing bytes to compress to the compressors' pool.
     compressor_tx: Sender<CompressorMessage>,
     /// Channel to send the receiving end of the one-shot channel that will be
@@ -154,36 +159,15 @@ pub struct PooledWriter {
 }
 
 impl PooledWriter {
-    /// Zip together all writers and senders to create a set of [`PooledWriter`]s.
-    ///
-    /// # Arguments
-    /// - `writers` - The conventional [`Write`] writers that are being exchanged.
-    /// - `compressor_tx` - The channel to send uncompressed bytes to the compressor pool.
-    /// - `writer_txs` - The `Send` ends of the channels that transmit the `Receiver` ends of the one-shot
-    ///                  channels, which will be consumed when the compressor sends the compressed bytes.
-    fn from_writers<W, C>(
-        writers: &[W],
-        compressor_tx: &Sender<CompressorMessage>,
-        writer_txs: &[Sender<Receiver<WriterMessage>>],
-    ) -> Vec<Self>
-    where
-        W: Write + Send + 'static,
-        C: Compressor,
-    {
-        writers
-            .iter()
-            .zip(writer_txs.iter())
-            .map(|(_w, writer_tx)| Self::new::<C>(compressor_tx.clone(), writer_tx.clone()))
-            .collect()
-    }
-
     /// Create a new [`PooledWriter`] that has an internal buffer capacity that matches [`bgzf::BGZF_BLOCK_SIZE`].
     ///
     /// # Arguments
+    /// - `index` - a usize representing that this is the nth pooled writer created within the pool
     /// - `compressor_tx` - The channel to send uncompressed bytes to the compressor pool.
     /// - `writer_tx` - The `Send` end of the channel that transmits the `Receiver` end of the one-shot
     ///                 channel, which will be consumed when the compressor sends the compressed bytes.
     fn new<C>(
+        index: usize,
         compressor_tx: Sender<CompressorMessage>,
         writer_tx: Sender<Receiver<WriterMessage>>,
     ) -> Self
@@ -191,6 +175,7 @@ impl PooledWriter {
         C: Compressor,
     {
         Self {
+            writer_index: index,
             compressor_tx,
             writer_tx,
             buffer: BytesMut::with_capacity(C::BLOCK_SIZE),
@@ -221,7 +206,7 @@ impl PooledWriter {
     /// Send a single block
     fn send_block(&mut self, is_last: bool) -> std::io::Result<()> {
         let bytes = self.buffer.split_to(self.buffer.len()).freeze();
-        let (mut m, r) = CompressorMessage::new_parts(bytes);
+        let (mut m, r) = CompressorMessage::new_parts(self.writer_index, bytes);
         m.is_last = is_last;
         self.writer_tx
             .send(r)
@@ -321,6 +306,8 @@ where
 /// A message that is sent from a [`PooledWriter`] to the compressor threadpool within a [`Pool`].
 #[derive(Debug)]
 struct CompressorMessage {
+    /// The index of the destination writer
+    writer_index: usize,
     /// The bytes to compress.
     buffer: Bytes,
     /// Where the compressed bytes will be sent after compression.
@@ -330,9 +317,9 @@ struct CompressorMessage {
 }
 
 impl CompressorMessage {
-    fn new_parts(buffer: Bytes) -> (Self, Receiver<WriterMessage>) {
+    fn new_parts(writer_index: usize, buffer: Bytes) -> (Self, Receiver<WriterMessage>) {
         let (tx, rx) = flume::unbounded(); // oneshot channel
-        let new = Self { buffer, oneshot: tx, is_last: false };
+        let new = Self { writer_index, buffer, oneshot: tx, is_last: false };
         (new, rx)
     }
 }
@@ -357,7 +344,10 @@ struct WriterMessage {
 /// two times the number of threads.
 ///
 /// Once created various functions can configure aspects of the pool.  It is best practice, though
-/// not required, to configure the builder _before_ exchanging writers.
+/// not required, to configure the builder _before_ exchanging writers.  The exception is
+/// `queue_size` that may _not_ be set after any writers have been exchanged.  If not set manually
+/// then `queue_size` defaults to the number of threads multiplied by
+/// [`PoolBuilder::QUEUE_SIZE_THREAD_MULTIPLES`].
 ///
 /// Once the builder is configured writers may be exchanged for [`PooledWriter`]s using the
 /// [`PoolBuilder::exchange`] function, which consumes the provided writer and returns a new
@@ -370,12 +360,12 @@ where
     W: Write + Send + 'static,
     C: Compressor,
 {
+    writer_index: usize,
     compression_level: C::CompressionLevel,
-    writer_queue_size: usize,
-    writer_threads: usize,
-    compressor_threads: usize,
-    compressor_tx: Sender<CompressorMessage>,
-    compressor_rx: Receiver<CompressorMessage>,
+    queue_size: Option<usize>,
+    threads: usize,
+    compressor_tx: Option<Sender<CompressorMessage>>,
+    compressor_rx: Option<Receiver<CompressorMessage>>,
     writers: Vec<W>,
     writer_txs: Vec<Sender<Receiver<WriterMessage>>>,
     writer_rxs: Vec<Receiver<Receiver<WriterMessage>>>,
@@ -386,32 +376,51 @@ where
     W: Write + Send + 'static,
     C: Compressor,
 {
-    /// Creates a new PoolBuilder that can be used to configure and build a [`Pool`].
-    pub fn new(compressor_queue_size: usize, writer_queues_size: usize) -> Self {
-        let (compressor_tx, compressor_rx) = flume::bounded(compressor_queue_size);
+    /// By default queue sizes will be set to threads * this constant.
+    pub const QUEUE_SIZE_THREAD_MULTIPLES: usize = 50;
 
+    /// The default number of threads that will be used if not otherwise configured
+    pub const DEFAULT_THREADS: usize = 4;
+
+    /// Creates a new PoolBuilder that can be used to configure and build a [`Pool`].
+    pub fn new() -> Self {
         PoolBuilder {
+            writer_index: 0,
             compression_level: C::default_compression_level(),
-            writer_queue_size: writer_queues_size,
-            writer_threads: 1,
-            compressor_threads: 1,
-            compressor_tx,
-            compressor_rx,
+            queue_size: None,
+            threads: Self::DEFAULT_THREADS,
+            compressor_tx: None,
+            compressor_rx: None,
             writers: vec![],
             writer_txs: vec![],
             writer_rxs: vec![],
         }
     }
 
-    /// Sets the number of writer threads that will be used by the [[Pool]].
-    pub fn writer_threads(mut self, n: usize) -> Self {
-        self.writer_threads = n;
+    /// Sets the number of threads that will be used by the [[Pool]].
+    ///
+    /// Will panic if set to 0.
+    pub fn threads(mut self, threads: usize) -> Self {
+        assert!(threads > 0, "Must provide a number of threads greater than 0.");
+        self.threads = threads;
         self
     }
 
-    /// Sets the number of compressor threads that will be used by the [[Pool]].
-    pub fn compressor_threads(mut self, n: usize) -> Self {
-        self.compressor_threads = n;
+    /// Sets the size of queues used by the pool [[Pool]].  The same size is used for
+    /// a) the queue of byte buffers to be compressed, b) the per-sample queues to receive
+    /// compressed bytes, and c) a control queue to manage writing to the underlying writers.
+    ///
+    /// In the worst case scenario the pool can be holding both queue_size uncompressed blocks
+    /// _and_ queue_size compressed blocks in memory when it cannot keep up with the incoming
+    /// load of writes.
+    ///
+    ///
+    ///
+    /// Will panic if called _after_ writers have been created because queues will already have
+    /// been created.
+    pub fn queue_size(mut self, queue_size: usize) -> Self {
+        assert!(self.writers.is_empty(), "Cannot set queue_size after writers are exchanged.");
+        self.queue_size.insert(queue_size);
         self
     }
 
@@ -422,12 +431,34 @@ where
         Ok(self)
     }
 
+    /// If queues/channels are not yet setup, initialize them.
+    fn ensure_queue_is_setup(&mut self) {
+        if self.compressor_tx.is_none() && self.compressor_rx.is_none() {
+            if self.queue_size.is_none() {
+                self.queue_size.insert(self.threads * Self::QUEUE_SIZE_THREAD_MULTIPLES);
+            }
+
+            let (tx, rx) = bounded(self.queue_size.unwrap());
+            self.compressor_tx.insert(tx);
+            self.compressor_rx.insert(rx);
+        }
+    }
+
     /// Exchanges a writer for a [[PooledWriter]].
     pub fn exchange(&mut self, writer: W) -> PooledWriter {
-        let (tx, rx): (Sender<Receiver<WriterMessage>>, Receiver<Receiver<WriterMessage>>) =
-            flume::bounded(self.writer_queue_size);
-        let p = PooledWriter::new::<C>(self.compressor_tx.clone(), tx.clone());
+        // Make sure queue/channel configuration is done
+        self.ensure_queue_is_setup();
 
+        let (tx, rx): (Sender<Receiver<WriterMessage>>, Receiver<Receiver<WriterMessage>>) =
+            flume::bounded(self.queue_size.expect("Unreachable"));
+
+        let p = PooledWriter::new::<C>(
+            self.writer_index,
+            self.compressor_tx.as_ref().expect("Unreachable").clone(),
+            tx.clone(),
+        );
+
+        self.writer_index += 1;
         self.writers.push(writer);
         self.writer_txs.push(tx);
         self.writer_rxs.push(rx);
@@ -435,17 +466,20 @@ where
     }
 
     /// Consumes the builder and generates the [[Pool]] ready for use.
-    pub fn build(self) -> PoolResult<Pool> {
+    pub fn build(mut self) -> PoolResult<Pool> {
+        // Make sure the queue/channel configuration is done - this could be necessary if
+        // a pool is created by zero writers exchanged.
+        self.ensure_queue_is_setup();
+
         // Create the channel to gracefully signal a shutdown of the pool
         let (shutdown_tx, shutdown_rx) = flume::unbounded();
 
         // Start the pool manager thread and thread pools
         let handle = std::thread::spawn(move || {
             Pool::pool_main::<W, C>(
-                self.writer_threads,
-                self.compressor_threads,
+                self.threads,
                 self.compression_level,
-                self.compressor_rx,
+                self.compressor_rx.expect("Unreachable."),
                 self.writer_rxs,
                 self.writers,
                 shutdown_rx,
@@ -453,13 +487,22 @@ where
         });
 
         let mut pool = Pool {
-            compressor_tx: Some(self.compressor_tx),
-            writers_txs: Some(self.writer_txs),
+            compressor_tx: self.compressor_tx,
             shutdown_tx: Some(shutdown_tx),
             pool_handle: Some(handle),
         };
 
         Ok(pool)
+    }
+}
+
+impl<W, C> Default for PoolBuilder<W, C>
+where
+    W: Write + Send + 'static,
+    C: Compressor,
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -477,43 +520,11 @@ pub struct Pool {
     pool_handle: Option<JoinHandle<PoolResult<()>>>,
     /// The send end of the channel for communicating with the compressor pool.
     compressor_tx: Option<Sender<CompressorMessage>>,
-    /// The send halves of the channels for the [`PooledWriter`]s to enqueue the one-shot channels.
-    writers_txs: Option<Vec<Sender<Receiver<WriterMessage>>>>,
     /// Sentinel channel to tell the pool management thread to shutdown.
     shutdown_tx: Option<Sender<()>>,
 }
 
 impl Pool {
-    /// Create a running pool along with an associated set of `pooled_writers`.
-    ///
-    /// # Arguments
-    /// - `num_writer_threads` - The number of writer threads to use in the writer pool.
-    /// - `num_compressor_threads` - The number of compressor threads to use in the compressor pool.
-    /// - `compression_level` - The compression level to use for the [`Compressor`] pool.
-    /// - `writers` - The writers to exchange for [`PooledWriter`]s.
-    #[allow(clippy::type_complexity, clippy::similar_names)]
-    #[deprecated(since = "0.3.0", note = "Use PoolBuilder in place of Pool::new().")]
-    pub fn new<W, C>(
-        num_writer_threads: usize,
-        num_compressor_threads: usize,
-        compression_level: u8,
-        writers: Vec<W>,
-    ) -> PoolResult<(Self, Vec<PooledWriter>)>
-    where
-        W: Write + Send + 'static,
-        C: Compressor,
-    {
-        let mut builder =
-            PoolBuilder::<W, C>::new(num_compressor_threads * 2, num_writer_threads * 2)
-                .compressor_threads(num_compressor_threads)
-                .writer_threads(num_writer_threads)
-                .compression_level(compression_level)?;
-
-        let pooled_writers = writers.into_iter().map(|w| builder.exchange(w)).collect();
-        let pool = builder.build()?;
-        Ok((pool, pooled_writers))
-    }
-
     /// The main "run" method for the pool that orchestrates all the pieces.
     ///
     /// The [`PooledWriter`]s are sending to the compressor, the compressor compresses them, then forwards the compressed bytes.
@@ -521,20 +532,18 @@ impl Pool {
     /// all values in the queue at once and writing till the queue is empty.
     ///
     /// # Arguments
-    /// - `num_writer_threads` - The number of writer threads to use in the writer pool.
-    /// - `num_compressor_threads` - The number of compressor threads to use in the compressor pool.
+    /// - `num_threads` - The number of threads to use.
     /// - `compression_level` - The compression level to use for the [`Compressor`] pool.
-    /// - `rx_compressor` - The receiving end of the channel for communicating with the compressor pool.
-    /// - `rxs_writers` - The receive halves of the channels for the [`PooledWriter`]s to enqueue the one-shot channels.
+    /// - `compressor_rx ` - The receiving end of the channel for communicating with the compressor pool.
+    /// - `writer_rxs ` - The receive halves of the channels for the [`PooledWriter`]s to enqueue the one-shot channels.
     /// - `writers` - The writers that were exchanged for [`PooledWriter`]s.
     /// - `shutdown_rx` - Sentinel channel to tell the pool management thread to shutdown.
     #[allow(clippy::unnecessary_wraps, clippy::needless_collect, clippy::needless_pass_by_value)]
     fn pool_main<W, C>(
-        num_writer_threads: usize,
-        num_compressor_threads: usize,
+        num_threads: usize,
         compression_level: C::CompressionLevel,
-        rx_compressor: Receiver<CompressorMessage>,
-        rxs_writers: Vec<Receiver<Receiver<WriterMessage>>>, // must be pass by value to allow for easy sharing between threads
+        compressor_rx: Receiver<CompressorMessage>,
+        writer_rxs: Vec<Receiver<Receiver<WriterMessage>>>, // must be pass by value to allow for easy sharing between threads
         writers: Vec<W>,
         shutdown_rx: Receiver<()>,
     ) -> PoolResult<()>
@@ -546,83 +555,82 @@ impl Pool {
         let writers: Arc<Vec<_>> =
             Arc::new(writers.into_iter().map(|w| Arc::new(Mutex::new(w))).collect());
 
-        // Writer threads
-        // Compressor threads
-        let compressor_handles: Vec<JoinHandle<PoolResult<()>>> = (0..num_compressor_threads)
-            .map(|_i| {
-                let rx_compressor = rx_compressor.clone();
-                let mut compressor = C::new(compression_level.clone());
-                std::thread::spawn(move || {
-                    while let Ok(message) = rx_compressor.recv() {
-                        // Compress the buffer in the message
-                        let chunk = &message.buffer;
-                        // Compress will correctly resize the compressed vec.
-                        let mut compressed = Vec::new();
-                        compressor
-                            .compress(chunk, &mut compressed, message.is_last)
-                            .map_err(|e| PoolError::CompressionError(e.to_string()))?;
-                        message
-                            .oneshot
-                            .send(WriterMessage { buffer: compressed })
-                            .map_err(|_e| PoolError::ChannelSend);
-                    }
-                    Ok(())
-                })
-            })
-            // Collect is needed to force the evaluation of the closure and start the loops
-            .collect();
+        // Generate one more channel for queuing up information about when a writer has data
+        // available to be written
+        let (write_available_tx, write_available_rx): (Sender<usize>, Receiver<usize>) =
+            flume::unbounded();
 
-        let writer_handles: Vec<JoinHandle<PoolResult<()>>> = (0..num_writer_threads)
-            .map(|_i| {
-                let rxs_writers = rxs_writers.clone();
-                let shutdown_rx = shutdown_rx.clone();
+        let thread_handles: Vec<JoinHandle<PoolResult<()>>> = (0..num_threads)
+            .map(|thread_idx| {
+                let compressor_rx = compressor_rx.clone();
+                let mut compressor = C::new(compression_level.clone());
+                let writer_rxs = writer_rxs.clone();
                 let writers = writers.clone();
+                let shutdown_rx = shutdown_rx.clone();
+                let sleep_delay = Duration::from_millis(25);
+                let write_available_tx = write_available_tx.clone();
+                let write_available_rx = write_available_rx.clone();
+
                 std::thread::spawn(move || {
-                    let mut i = 0;
                     loop {
-                        if i == rxs_writers.len() {
-                            i = 0;
+                        let mut did_something = false;
+
+                        // Try to process one compression message
+                        if let Ok(message) = compressor_rx.try_recv() {
+                            // Compress the buffer in the message
+                            let chunk = &message.buffer;
+                            // Compress will correctly resize the compressed vec.
+                            let mut compressed = Vec::new();
+                            compressor
+                                .compress(chunk, &mut compressed, message.is_last)
+                                .map_err(|e| PoolError::CompressionError(e.to_string()))?;
+                            message
+                                .oneshot
+                                .send(WriterMessage { buffer: compressed })
+                                .map_err(|_e| PoolError::ChannelSend);
+                            write_available_tx.send(message.writer_index);
+                            did_something = true;
                         }
 
-                        // The compiler is better about ignoring the bounds check in this scenario
-                        if let Some(rx_writer) = rxs_writers.get(i) {
-                            if !rx_writer.is_empty() {
-                                let mut writer = writers[i].lock();
-                                while let Ok(message) = rx_writer.try_recv() {
-                                    let message = message.recv()?;
-                                    writer.write_all(&message.buffer)?;
-                                }
+                        // Then try to process one write message
+                        if let Ok(writer_index) = write_available_rx.try_recv() {
+                            let mut writer = writers[writer_index].lock();
+                            let writer_rx = &writer_rxs[writer_index];
+                            let one_shot_rx = writer_rx.recv()?;
+                            let write_message = one_shot_rx.recv()?;
+                            writer.write_all(&write_message.buffer)?;
+                            did_something = true;
+                        }
+
+                        // If we didn't do anything either sleep for a few ms to avoid busy-waiting
+                        // or if shutdown is requested and all the channels are empty, terminate.
+                        if !did_something {
+                            if shutdown_rx.is_disconnected()
+                                && write_available_rx.is_empty()
+                                && compressor_rx.is_empty()
+                                && writer_rxs.iter().all(|w| w.is_empty())
+                            {
+                                break;
+                            } else {
+                                std::thread::sleep(sleep_delay);
                             }
                         }
-
-                        i += 1;
-
-                        if shutdown_rx.is_disconnected()
-                            && rxs_writers.iter().all(|w| w.is_disconnected() && w.is_empty())
-                        {
-                            // If all receivers are disconnected (the senders have been dropped, then we are done)
-                            break;
-                        }
                     }
 
                     Ok(())
                 })
             })
-            // Collect is needed to force the evaluation of the closure and start the loops
             .collect();
 
-        // close writer handles
-        writer_handles.into_iter().try_for_each(|handle| match handle.join() {
+        // Close writer handles
+        thread_handles.into_iter().try_for_each(|handle| match handle.join() {
             Ok(result) => result,
             Err(e) => std::panic::resume_unwind(e),
         });
+
         // Flush each writer
         writers.iter().try_for_each(|w| w.lock().flush())?;
-        // close compressor handles
-        compressor_handles.into_iter().try_for_each(|handle| match handle.join() {
-            Ok(result) => result,
-            Err(e) => std::panic::resume_unwind(e),
-        });
+
         Ok(())
     }
 
@@ -640,12 +648,6 @@ impl Pool {
         // Shutdown called to force writers to start checking their receivers for disconnection / empty
         drop(self.shutdown_tx.take());
 
-        // Drop the copy of the writer senders that the pool holds
-        // TODO: the pool probably doesn't need these anyways.
-        self.writers_txs.take().into_iter().enumerate().for_each(|(i, w)| {
-            // Wait for writing to finish
-            drop(w);
-        });
         // Wait on the pool thread to finish and pull any errors from it
         match self.pool_handle.take().unwrap().join() {
             Ok(result) => result,
@@ -657,8 +659,7 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         // Check if `stop_pool` has already been called. If it hasn't, call it.
-        if self.compressor_tx.is_some() && self.pool_handle.is_some() && self.writers_txs.is_some()
-        {
+        if self.compressor_tx.is_some() && self.pool_handle.is_some() {
             self.stop_pool().unwrap();
         }
     }
@@ -671,9 +672,11 @@ impl Drop for Pool {
 #[cfg(test)]
 mod test {
     use std::{
+        assert_eq, format,
         fs::File,
         io::{BufReader, BufWriter},
         path::{Path, PathBuf},
+        vec,
     };
 
     use crate::bgzf::BgzfCompressor;
@@ -699,38 +702,11 @@ mod test {
             .into_iter()
             .map(|i| create_output_file_name(format!("test.{}.txt.gz", i), &dir.path()))
             .collect();
-        let output_writers = output_names.iter().map(create_output_writer).collect();
-
-        #[allow(deprecated)]
-        let (mut pool, mut pooled_writers) =
-            Pool::new::<_, BgzfCompressor>(1, 1, 2, output_writers).unwrap();
-
-        for (i, writer) in pooled_writers.iter_mut().enumerate() {
-            writer.write_all(format!("This is writer {}.", i).as_bytes()).unwrap();
-        }
-        pooled_writers.into_iter().try_for_each(|mut w| w.flush()).unwrap();
-        pool.stop_pool();
-
-        for (i, path) in output_names.iter().enumerate() {
-            let mut reader = Reader::new(BufReader::new(File::open(path).unwrap()));
-            let mut actual = vec![];
-            reader.read_to_end(&mut actual).unwrap();
-            assert_eq!(actual, format!("This is writer {}.", i).as_bytes());
-        }
-    }
-
-    #[test]
-    fn test_builder() {
-        let dir = tempdir().unwrap();
-        let output_names: Vec<PathBuf> = (0..20)
-            .into_iter()
-            .map(|i| create_output_file_name(format!("test.{}.txt.gz", i), &dir.path()))
-            .collect();
 
         let output_writers: Vec<BufWriter<File>> =
             output_names.iter().map(create_output_writer).collect();
         let mut builder =
-            PoolBuilder::<_, BgzfCompressor>::new(10, 10).compression_level(2).unwrap();
+            PoolBuilder::<_, BgzfCompressor>::new().threads(8).compression_level(2).unwrap();
         let mut pooled_writers: Vec<PooledWriter> =
             output_writers.into_iter().map(|w| builder.exchange(w)).collect();
         let mut pool = builder.build().unwrap();
@@ -758,9 +734,8 @@ mod test {
             input_size in 1..=BUFSIZE * 4,
             buf_size in 1..=BUFSIZE,
             num_output_files in 1..2*num_cpus::get(),
-            writer_threads in 1..=num_cpus::get(),
-            comp_threads in 1..=num_cpus::get(),
-            comp_level in 1..=12_u8,
+            threads in 1..=2+num_cpus::get(),
+            comp_level in 1..=8_u8,
             write_size in 1..=2*BUFSIZE,
         ) {
             let dir = tempdir().unwrap();
@@ -768,9 +743,14 @@ mod test {
                 .into_iter()
                 .map(|i| create_output_file_name(format!("test.{}.txt.gz", i), &dir.path()))
                 .collect();
-            let output_writers = output_names.iter().map(create_output_writer).collect();
+            let output_writers: Vec<_> = output_names.iter().map(create_output_writer).collect();
 
-            let (mut pool, mut pooled_writers) = Pool::new::<_, BgzfCompressor>(writer_threads, comp_threads, comp_level, output_writers).unwrap();
+            let mut builder = PoolBuilder::<_, BgzfCompressor>::new()
+                .threads(threads)
+                .compression_level(comp_level)?;
+
+            let mut pooled_writers: Vec<_> = output_writers.into_iter().map(|w| builder.exchange(w)).collect();
+            let mut pool = builder.build()?;
 
             let inputs: Vec<Vec<u8>> = (0..num_output_files).map(|_| {
                 (0..input_size).map(|_| rand::random::<u8>()).collect()
