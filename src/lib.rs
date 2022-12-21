@@ -546,7 +546,6 @@ impl Pool {
                         if !did_something {
                             if shutdown_rx.is_disconnected()
                                 && write_available_rx.is_empty()
-                                && compressor_rx.is_disconnected()
                                 && compressor_rx.is_empty()
                                 && writer_rxs.iter().all(|w| w.is_empty())
                             {
@@ -591,7 +590,6 @@ impl Pool {
         // Drop the copy of the writer senders that the pool holds
         // TODO: the pool probably doesn't need these anyways.
         self.writers_txs.take().into_iter().enumerate().for_each(|(i, w)| {
-            // Wait for writing to finish
             drop(w);
         });
         // Wait on the pool thread to finish and pull any errors from it
