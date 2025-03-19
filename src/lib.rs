@@ -104,8 +104,8 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use flume::{self, bounded, Receiver, Sender};
-use parking_lot::{lock_api::RawMutex, Mutex};
+use flume::{self, Receiver, Sender, bounded};
+use parking_lot::{Mutex, lock_api::RawMutex};
 use thiserror::Error;
 
 /// 128 KB default buffer size, same as pigz.
@@ -699,8 +699,7 @@ mod test {
     fn test_simple() {
         let dir = tempdir().unwrap();
         let output_names: Vec<PathBuf> = (0..20)
-            .into_iter()
-            .map(|i| create_output_file_name(format!("test.{}.txt.gz", i), &dir.path()))
+            .map(|i| create_output_file_name(format!("test.{}.txt.gz", i), dir.path()))
             .collect();
 
         let output_writers: Vec<BufWriter<File>> =
@@ -740,8 +739,7 @@ mod test {
         ) {
             let dir = tempdir().unwrap();
             let output_names: Vec<PathBuf> = (0..num_output_files)
-                .into_iter()
-                .map(|i| create_output_file_name(format!("test.{}.txt.gz", i), &dir.path()))
+                .map(|i| create_output_file_name(format!("test.{}.txt.gz", i), dir.path()))
                 .collect();
             let output_writers: Vec<_> = output_names.iter().map(create_output_writer).collect();
 
