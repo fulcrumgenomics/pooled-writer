@@ -1,4 +1,4 @@
-///! An implementation of [`Compressor`] for the `BGZF` format.
+//! An implementation of [`Compressor`] for the `BGZF` format.
 use crate::Compressor;
 
 /// A BGZF compressor.
