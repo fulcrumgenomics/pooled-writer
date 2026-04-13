@@ -151,7 +151,7 @@ pub struct PooledWriter {
     /// used to send the compressed bytes. This effectively "place holds" the
     /// position of the compressed bytes in the writers queue until the compressed bytes
     /// are ready.
-    writer_tx: Sender<Receiver<WriterMessage>>,
+    writer_tx: Sender<oneshot::Receiver<WriterMessage>>,
     /// The internal buffer to gather bytes to send.
     buffer: BytesMut,
     /// The desired size of the internal buffer.
@@ -169,7 +169,7 @@ impl PooledWriter {
     fn new<C>(
         index: usize,
         compressor_tx: Sender<CompressorMessage>,
-        writer_tx: Sender<Receiver<WriterMessage>>,
+        writer_tx: Sender<oneshot::Receiver<WriterMessage>>,
     ) -> Self
     where
         C: Compressor,
@@ -304,22 +304,21 @@ where
 ////////////////////////////////////////////////////////////////////////////////
 
 /// A message that is sent from a [`PooledWriter`] to the compressor threadpool within a [`Pool`].
-#[derive(Debug)]
 struct CompressorMessage {
     /// The index of the destination writer
     writer_index: usize,
     /// The bytes to compress.
     buffer: Bytes,
     /// Where the compressed bytes will be sent after compression.
-    oneshot: Sender<WriterMessage>,
+    oneshot_tx: oneshot::Sender<WriterMessage>,
     /// A sentinel value to let the compressor know that the BGZF stream needs an EOF.
     is_last: bool,
 }
 
 impl CompressorMessage {
-    fn new_parts(writer_index: usize, buffer: Bytes) -> (Self, Receiver<WriterMessage>) {
-        let (tx, rx) = flume::unbounded(); // oneshot channel
-        let new = Self { writer_index, buffer, oneshot: tx, is_last: false };
+    fn new_parts(writer_index: usize, buffer: Bytes) -> (Self, oneshot::Receiver<WriterMessage>) {
+        let (tx, rx) = oneshot::channel();
+        let new = Self { writer_index, buffer, oneshot_tx: tx, is_last: false };
         (new, rx)
     }
 }
@@ -373,8 +372,8 @@ where
     compressor_tx: Option<Sender<CompressorMessage>>,
     compressor_rx: Option<Receiver<CompressorMessage>>,
     writers: Vec<W>,
-    writer_txs: Vec<Sender<Receiver<WriterMessage>>>,
-    writer_rxs: Vec<Receiver<Receiver<WriterMessage>>>,
+    writer_txs: Vec<Sender<oneshot::Receiver<WriterMessage>>>,
+    writer_rxs: Vec<Receiver<oneshot::Receiver<WriterMessage>>>,
 }
 
 impl<W, C> PoolBuilder<W, C>
@@ -455,8 +454,10 @@ where
         // Make sure queue/channel configuration is done
         self.ensure_queue_is_setup();
 
-        let (tx, rx): (Sender<Receiver<WriterMessage>>, Receiver<Receiver<WriterMessage>>) =
-            flume::bounded(self.queue_size.expect("Unreachable"));
+        let (tx, rx): (
+            Sender<oneshot::Receiver<WriterMessage>>,
+            Receiver<oneshot::Receiver<WriterMessage>>,
+        ) = flume::bounded(self.queue_size.expect("Unreachable"));
 
         let p = PooledWriter::new::<C>(
             self.writer_index,
@@ -549,7 +550,7 @@ impl Pool {
         num_threads: usize,
         compression_level: C::CompressionLevel,
         compressor_rx: Receiver<CompressorMessage>,
-        writer_rxs: Vec<Receiver<Receiver<WriterMessage>>>, // must be pass by value to allow for easy sharing between threads
+        writer_rxs: Vec<Receiver<oneshot::Receiver<WriterMessage>>>, // must be pass by value to allow for easy sharing between threads
         writers: Vec<W>,
         shutdown_rx: Receiver<()>,
     ) -> PoolResult<()>
@@ -607,7 +608,7 @@ impl Pool {
                                     .compress(chunk, &mut compress_buf, message.is_last)
                                     .map_err(|e| PoolError::CompressionError(e.to_string()))?;
                                 message
-                                    .oneshot
+                                    .oneshot_tx
                                     .send(WriterMessage { buffer: compress_buf.clone() })
                                     .map_err(|_e| PoolError::ChannelSend);
                                 write_available_tx.send(message.writer_index);
@@ -616,7 +617,8 @@ impl Pool {
                                 let mut writer = writers[writer_index].lock();
                                 let writer_rx = &writer_rxs[writer_index];
                                 let one_shot_rx = writer_rx.recv()?;
-                                let write_message = one_shot_rx.recv()?;
+                                let write_message =
+                                    one_shot_rx.recv().map_err(|_| PoolError::ChannelSend)?;
                                 writer.write_all(&write_message.buffer)?;
                             }
                             None => {
