@@ -655,11 +655,10 @@ impl Pool {
     /// Ideally the [`PooledWriter`]s should all have been flushed first, that is up to the user. Any
     /// further attempts to send to the [`Pool`] will return an error.
     pub fn stop_pool(&mut self) -> Result<(), PoolError> {
-        let compressor_queue = self.compressor_tx.take().unwrap();
-        while !compressor_queue.is_empty() {
-            // Wait for compression to finish before dropping the sender
-        }
-        drop(compressor_queue);
+        // Drop the compressor sender to disconnect the channel.  Buffered
+        // messages are preserved by flume and will be drained by the worker
+        // threads before they observe the disconnect and shut down.
+        drop(self.compressor_tx.take().unwrap());
 
         // Shutdown called to force writers to start checking their receivers for disconnection / empty
         drop(self.shutdown_tx.take());
