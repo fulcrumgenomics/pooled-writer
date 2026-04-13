@@ -572,21 +572,23 @@ impl Pool {
                 let write_available_rx = write_available_rx.clone();
 
                 std::thread::spawn(move || {
+                    // Reuse a single compression buffer per thread to avoid
+                    // re-allocating ~70KB on every block.
+                    let mut compress_buf = Vec::new();
+
                     loop {
                         let mut did_something = false;
 
                         // Try to process one compression message
                         if let Ok(message) = compressor_rx.try_recv() {
-                            // Compress the buffer in the message
                             let chunk = &message.buffer;
-                            // Compress will correctly resize the compressed vec.
-                            let mut compressed = Vec::new();
+                            compress_buf.clear();
                             compressor
-                                .compress(chunk, &mut compressed, message.is_last)
+                                .compress(chunk, &mut compress_buf, message.is_last)
                                 .map_err(|e| PoolError::CompressionError(e.to_string()))?;
                             message
                                 .oneshot
-                                .send(WriterMessage { buffer: compressed })
+                                .send(WriterMessage { buffer: compress_buf.clone() })
                                 .map_err(|_e| PoolError::ChannelSend);
                             write_available_tx.send(message.writer_index);
                             did_something = true;
