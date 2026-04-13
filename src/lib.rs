@@ -333,6 +333,12 @@ struct WriterMessage {
     buffer: Vec<u8>,
 }
 
+/// Internal enum used by worker threads to dispatch between compression and write work.
+enum WorkItem {
+    Compress(CompressorMessage),
+    Write(usize),
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // The PoolBuilder struct and impls
 ////////////////////////////////////////////////////////////////////////////////
@@ -567,9 +573,9 @@ impl Pool {
                 let writer_rxs = writer_rxs.clone();
                 let writers = writers.clone();
                 let shutdown_rx = shutdown_rx.clone();
-                let sleep_delay = Duration::from_millis(25);
                 let write_available_tx = write_available_tx.clone();
                 let write_available_rx = write_available_rx.clone();
+                let select_timeout = Duration::from_millis(100);
 
                 std::thread::spawn(move || {
                     // Reuse a single compression buffer per thread to avoid
@@ -577,44 +583,52 @@ impl Pool {
                     let mut compress_buf = Vec::new();
 
                     loop {
-                        let mut did_something = false;
+                        // Try non-blocking receives first (fast path under load).
+                        // Then fall through to Selector which blocks until work
+                        // arrives, avoiding the old sleep(25ms) polling delay.
+                        let item = if let Ok(msg) = compressor_rx.try_recv() {
+                            Some(WorkItem::Compress(msg))
+                        } else if let Ok(idx) = write_available_rx.try_recv() {
+                            Some(WorkItem::Write(idx))
+                        } else {
+                            flume::Selector::new()
+                                .recv(&compressor_rx, |r| r.ok().map(WorkItem::Compress))
+                                .recv(&write_available_rx, |r| r.ok().map(WorkItem::Write))
+                                .wait_timeout(select_timeout)
+                                .ok()
+                                .flatten()
+                        };
 
-                        // Try to process one compression message
-                        if let Ok(message) = compressor_rx.try_recv() {
-                            let chunk = &message.buffer;
-                            compress_buf.clear();
-                            compressor
-                                .compress(chunk, &mut compress_buf, message.is_last)
-                                .map_err(|e| PoolError::CompressionError(e.to_string()))?;
-                            message
-                                .oneshot
-                                .send(WriterMessage { buffer: compress_buf.clone() })
-                                .map_err(|_e| PoolError::ChannelSend);
-                            write_available_tx.send(message.writer_index);
-                            did_something = true;
-                        }
-
-                        // Then try to process one write message
-                        if let Ok(writer_index) = write_available_rx.try_recv() {
-                            let mut writer = writers[writer_index].lock();
-                            let writer_rx = &writer_rxs[writer_index];
-                            let one_shot_rx = writer_rx.recv()?;
-                            let write_message = one_shot_rx.recv()?;
-                            writer.write_all(&write_message.buffer)?;
-                            did_something = true;
-                        }
-
-                        // If we didn't do anything either sleep for a few ms to avoid busy-waiting
-                        // or if shutdown is requested and all the channels are empty, terminate.
-                        if !did_something {
-                            if shutdown_rx.is_disconnected()
-                                && write_available_rx.is_empty()
-                                && compressor_rx.is_empty()
-                                && writer_rxs.iter().all(|w| w.is_empty())
-                            {
-                                break;
-                            } else {
-                                std::thread::sleep(sleep_delay);
+                        match item {
+                            Some(WorkItem::Compress(message)) => {
+                                let chunk = &message.buffer;
+                                compress_buf.clear();
+                                compressor
+                                    .compress(chunk, &mut compress_buf, message.is_last)
+                                    .map_err(|e| PoolError::CompressionError(e.to_string()))?;
+                                message
+                                    .oneshot
+                                    .send(WriterMessage { buffer: compress_buf.clone() })
+                                    .map_err(|_e| PoolError::ChannelSend);
+                                write_available_tx.send(message.writer_index);
+                            }
+                            Some(WorkItem::Write(writer_index)) => {
+                                let mut writer = writers[writer_index].lock();
+                                let writer_rx = &writer_rxs[writer_index];
+                                let one_shot_rx = writer_rx.recv()?;
+                                let write_message = one_shot_rx.recv()?;
+                                writer.write_all(&write_message.buffer)?;
+                            }
+                            None => {
+                                // Timeout or channel disconnect. Check if all work
+                                // is drained and shutdown was requested.
+                                if shutdown_rx.is_disconnected()
+                                    && write_available_rx.is_empty()
+                                    && compressor_rx.is_empty()
+                                    && writer_rxs.iter().all(|w| w.is_empty())
+                                {
+                                    break;
+                                }
                             }
                         }
                     }
